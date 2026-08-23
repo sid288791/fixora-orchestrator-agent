@@ -31,6 +31,22 @@ AVAILABLE_AGENTS_DESC = """Available diagnostic agents (READ-ONLY) and their che
 5. "kubernetes"    - Pods & Events (pod_status, restart_count, resource_limits, oom_kills, node_pressure, hpa_status)
 6. "deployment"    - Changes & Releases (recent_releases, config_changes, feature_flags, rollback_history)"""
 
+AGENT_DESC_LINES = {
+    "grafana": '1. "grafana"       - Metrics & Dashboards (cpu_usage, memory_usage, disk_io, network, gc_activity, latency_p99, throughput)',
+    "kibana": '2. "kibana"        - Logs & Search (error_logs, container_logs, db_timeout_logs, oom_events, exception_traces)',
+    "opentelemetry": '3. "opentelemetry" - Traces & Spans (slowest_spans, latency_breakdown, dependency_calls, error_rate_by_span)',
+    "kafka": '4. "kafka"         - Kafka health (consumer_lag, topic_partition_health, broker_health, message_rate, isr_status)',
+    "kubernetes": '5. "kubernetes"    - Pods & Events (pod_status, restart_count, resource_limits, oom_kills, node_pressure, hpa_status)',
+    "deployment": '6. "deployment"    - Changes & Releases (recent_releases, config_changes, feature_flags, rollback_history)',
+}
+
+
+def _agents_desc(available_agents: Optional[List[str]]) -> str:
+    if not available_agents:
+        return AVAILABLE_AGENTS_DESC
+    lines = [AGENT_DESC_LINES[a] for a in available_agents if a in AGENT_DESC_LINES]
+    return "Available diagnostic agents (READ-ONLY) and their checks:\n" + "\n".join(lines)
+
 HYPOTHESES_PROMPT = """You are an SRE AI diagnosing a production alert.
 
 {agents}
@@ -175,6 +191,8 @@ class DiagnosticLoop:
         max_iterations: int = 3,
         confidence_threshold: float = 0.8,
         max_checks_per_iteration: int = 4,
+        llm_call: Optional[Any] = None,
+        available_agents: Optional[List[str]] = None,
     ):
         self.evidence_provider = evidence_provider
         self.ollama_base_url = ollama_base_url
@@ -182,6 +200,9 @@ class DiagnosticLoop:
         self.max_iterations = max_iterations
         self.confidence_threshold = confidence_threshold
         self.max_checks_per_iteration = max_checks_per_iteration
+        self.llm_call = llm_call
+        self.available_agents = available_agents
+        self.agents_desc = _agents_desc(available_agents)
 
     async def run(self, alert: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the bounded diagnostic loop. Returns final RCA + full trace."""
@@ -195,7 +216,7 @@ class DiagnosticLoop:
         t0 = time.time()
         hyp_response = _parse_json(
             await self._call_llm(
-                HYPOTHESES_PROMPT.format(agents=AVAILABLE_AGENTS_DESC, alert=alert_json)
+                HYPOTHESES_PROMPT.format(agents=self.agents_desc, alert=alert_json)
             )
         )
         hypotheses = hyp_response.get("hypotheses", [])
@@ -217,7 +238,7 @@ class DiagnosticLoop:
                     PLAN_PROMPT.format(
                         iteration=iteration,
                         max_iterations=self.max_iterations,
-                        agents=AVAILABLE_AGENTS_DESC,
+                        agents=self.agents_desc,
                         alert=alert_json,
                         hypotheses=json.dumps(hypotheses, indent=2),
                         evidence=json.dumps(all_evidence, indent=2) or "none yet",
@@ -226,6 +247,8 @@ class DiagnosticLoop:
                 )
             )
             requests = plan.get("requests", [])[: self.max_checks_per_iteration]
+            if self.available_agents:
+                requests = [r for r in requests if (r.get("agent") or "").lower().strip() in self.available_agents]
             # Drop already-collected checks
             requests = [
                 r for r in requests
@@ -298,6 +321,9 @@ class DiagnosticLoop:
         }
 
     async def _call_llm(self, prompt: str) -> str:
+        if self.llm_call is not None:
+            return await self.llm_call(prompt)
+
         # /no_think disables qwen3 reasoning tokens; format=json forces valid JSON output
         async with httpx.AsyncClient(timeout=600.0) as client:
             response = await client.post(
