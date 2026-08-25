@@ -19,8 +19,11 @@ from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from temporalio.client import Client as TemporalClient
 
+from ai_coordinator.diagnostic_loop import DiagnosticLoop, HTTPEvidenceProvider
+from ai_coordinator.groq_llm import call_groq
 from models import HumanApprovalRequest, HumanApprovalResponse, ApprovalDecision
 from workflows.incident_workflow import IncidentWorkflow
 
@@ -35,6 +38,12 @@ PORT = int(os.environ.get("PORT", "8091"))
 TEMPORAL_HOST = os.environ.get("TEMPORAL_HOST", "localhost:7233")
 TEMPORAL_NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
 TEMPORAL_TASK_QUEUE = os.environ.get("TEMPORAL_TASK_QUEUE", "fixora-orchestrator-task-queue")
+
+DIAGNOSTIC_ORCHESTRATOR_URL = os.environ.get("DIAGNOSTIC_ORCHESTRATOR_URL", "http://localhost:8092")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+DEEP_ANALYSIS_MAX_ITERATIONS = int(os.environ.get("DEEP_ANALYSIS_MAX_ITERATIONS", "3"))
+DEEP_ANALYSIS_CONFIDENCE_THRESHOLD = float(os.environ.get("DEEP_ANALYSIS_CONFIDENCE_THRESHOLD", "0.8"))
 
 SERVICE_NAME = "fixora-orchestrator-agent"
 
@@ -144,6 +153,52 @@ async def get_workflow_status(incident_id: str):
         }
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Workflow not found: {str(e)}")
+
+
+def build_diagnostic_loop() -> DiagnosticLoop:
+    async def llm_call(prompt: str) -> str:
+        return await call_groq(prompt, api_key=LLM_API_KEY, model=LLM_MODEL)
+
+    return DiagnosticLoop(
+        evidence_provider=HTTPEvidenceProvider(DIAGNOSTIC_ORCHESTRATOR_URL),
+        llm_call=llm_call,
+        available_agents=["kibana"],
+        max_iterations=DEEP_ANALYSIS_MAX_ITERATIONS,
+        confidence_threshold=DEEP_ANALYSIS_CONFIDENCE_THRESHOLD,
+    )
+
+
+class DeepAnalysisRequest(BaseModel):
+    incident_id: str
+    alert_name: str
+    message: str = ""
+    severity: str = "info"
+    app_name: str
+    existing_rca: Optional[str] = None
+
+
+@app.post("/api/v1/deep-analysis")
+async def deep_analysis(request: DeepAnalysisRequest):
+    """
+    Runs the phase-1 diagnostic-only Deep Analysis: hypothesis -> evidence
+    (Kibana only) -> replan -> conclusion. Triggered when a human clicks
+    "Start Deep Analysis" in the Fixora UI on an alert's RCA card -- that
+    click IS the human approval; there is no separate Temporal workflow for
+    this call (see the class docstring above for the full 9-step workflow,
+    which this endpoint does not use).
+    """
+    alert = {
+        "alert_id": request.incident_id,
+        "alert_name": request.alert_name,
+        "message": request.message,
+        "severity": request.severity,
+        "service": request.app_name,
+        "existing_rca": request.existing_rca,
+    }
+
+    loop = build_diagnostic_loop()
+    result = await loop.run(alert)
+    return result
 
 
 @app.get("/")
